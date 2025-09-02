@@ -3,10 +3,10 @@
 Fast desktop UI for gel band detection + standard curve (NO Streamlit).
 
 Install deps:
-    pip install dearpygui opencv-python scikit-image scipy numpy pandas
+    pip install -r requirements.txt
 
 Run:
-    python gel_gui.py
+    python detect_gel.py
 
 Features:
   - Visualize detected lanes/bands (overlay)
@@ -17,21 +17,22 @@ Features:
   - Save annotated image (overlay) and background-subtracted image from UI
 """
 from __future__ import annotations
-import os, json
-from typing import List, Tuple, Dict
+import os
+from typing import List, Dict
 
 import numpy as np
 import cv2
 import pandas as pd
-from scipy.stats import linregress
-
-try:
-    from skimage.restoration import rolling_ball
-    HAS_RB = True
-except Exception:
-    HAS_RB = False
-
 import dearpygui.dearpygui as dpg
+
+from gel_detection import load_gray, detect_all
+from standard_curve import (
+    fit_standard_curve,
+    apply_curve_to_all,
+    save_curve,
+    refresh_curve_dropdown,
+    load_curve_selected,
+)
 
 # -------------------- Defaults / State --------------------
 NUM_LANES_GUESS_DEFAULT      = 10
@@ -56,124 +57,16 @@ COLORS = [(0,255,0),(0,200,255),(255,0,0),(255,0,255),(255,160,0),(0,255,160)]
 
 # -------------------- Core detection --------------------
 
-def load_gray(path: str) -> np.ndarray:
-    """Load image at *path* as grayscale.
-
-    Using ``cv2.imread`` can trigger a crash on Windows when the file path
-    contains non-ASCII characters (e.g. Korean).  To avoid this, read the
-    file bytes manually and decode with ``cv2.imdecode``, which correctly
-    handles Unicode paths.  If decoding fails, raise ``RuntimeError`` so the
-    caller can report an error instead of the process exiting with
-    ``0xC0000005``.
-    """
-
-    try:
-        # ``np.fromfile`` supports Unicode paths on Windows.
-        data = np.fromfile(path, dtype=np.uint8)
-    except Exception as e:
-        raise RuntimeError(f"Failed to read image bytes: {path}: {e}")
-
-    g = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
-    if g is None:
-        raise RuntimeError(f"Failed to decode image: {path}")
-    return g
-
-
-def background_subtract(gray: np.ndarray, radius_frac: float) -> np.ndarray:
-    g = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    diag = float(np.hypot(*g.shape))
-    if HAS_RB:
-        rad = max(20, int(radius_frac * diag))
-        bg = rolling_ball(g, radius=rad)
-        sub = cv2.subtract(g, np.asarray(bg, dtype=np.uint8))
-    else:
-        k = max(31, int(radius_frac * diag) | 1)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        bg = cv2.morphologyEx(g, cv2.MORPH_OPEN, kernel)
-        sub = cv2.subtract(g, bg)
-    # ensure bands are bright
-    if sub.mean() < 128:
-        sub = cv2.bitwise_not(sub)
-    sub = cv2.GaussianBlur(sub, (0,0), 1.0)
-    return sub
-
-
-def detect_lanes(sub: np.ndarray, num_guess: int) -> Tuple[List[Tuple[int,int]], np.ndarray]:
-    from scipy.signal import find_peaks
-    H, W = sub.shape
-    col_sum = sub.sum(axis=0).astype(np.float32)
-    col_sum = cv2.GaussianBlur(col_sum.reshape(1,-1), (1,0), 5).ravel()
-    distance = max(5, W // max(1, (num_guess * 2))) if num_guess else None
-    peaks, _ = find_peaks(col_sum, distance=distance, prominence=max(10.0, col_sum.max()*0.02))
-    centers = np.sort(peaks)
-    if len(centers) == 0:
-        return [(0, W-1)], np.array([], dtype=int)
-    mids = ((centers[:-1] + centers[1:]) // 2).astype(int) if len(centers) > 1 else np.array([W//2])
-    lefts  = np.concatenate([[0], mids])
-    rights = np.concatenate([mids, [W-1]])
-    bounds = list(zip(lefts, rights))
-    return bounds, centers
-
-
-def lane_profile(sub: np.ndarray, x0: int, x1: int) -> np.ndarray:
-    lane = sub[:, x0:x1+1]
-    prof = lane.mean(axis=1).astype(np.float32)
-    base = cv2.GaussianBlur(prof.reshape(-1,1), (0,0), sigmaX=15).ravel()
-    prof2 = np.clip(prof - base, 0, None)
-    prof2 = cv2.GaussianBlur(prof2.reshape(-1,1), (0,0), sigmaX=2).ravel()
-    return prof2
-
-
-def detect_bands_from_profile(prof: np.ndarray, img_h: int, prom_frac: float, min_w_frac: float):
-    from scipy.signal import find_peaks
-    min_prom  = max(5.0, float(prof.max()) * prom_frac)
-    min_width = max(2, int(img_h * min_w_frac))
-    peaks, props = find_peaks(prof, prominence=min_prom, width=min_width)
-    bands = []
-    for i, p in enumerate(peaks):
-        left  = int(props["left_ips"][i])
-        right = int(props["right_ips"][i])
-        area  = float(prof[left:right+1].sum())
-        bands.append({
-            "y": int(p), "y0": left, "y1": right,
-            "prom": float(props["prominences"][i]),
-            "width": float(props["widths"][i]),
-            "area1d": area
-        })
-    return bands
-
-
-def quantify_lane(sub: np.ndarray, x0: int, x1: int, bands: List[dict]):
-    lane = sub[:, x0:x1+1].astype(np.float32)
-    rows = []
-    for b in bands:
-        sl = lane[b["y0"]:b["y1"]+1, :]
-        area2d = float(sl.sum())
-        rows.append({**b, "area2d": area2d, "x0": x0, "x1": x1})
-    return rows
-
 
 def run_detection():
     if state["gray"] is None:
         return
     radius = dpg.get_value("ui_radius")
     numlan = dpg.get_value("ui_numlanes")
-    prom   = dpg.get_value("ui_prom")
-    minw   = dpg.get_value("ui_minw")
+    prom = dpg.get_value("ui_prom")
+    minw = dpg.get_value("ui_minw")
 
-    sub = background_subtract(state["gray"], radius)
-    lanes, centers = detect_lanes(sub, numlan)
-    H, W = sub.shape
-
-    rows = []
-    for li,(x0,x1) in enumerate(lanes, start=1):
-        prof = lane_profile(sub, x0, x1)
-        bands = detect_bands_from_profile(prof, H, prom, minw)
-        qrows = quantify_lane(sub, x0, x1, bands)
-        for r in qrows:
-            r.update({"lane": li})
-        rows.extend(qrows)
-
+    sub, lanes, rows = detect_all(state["gray"], radius, numlan, prom, minw)
     state["sub"] = sub
     state["lanes"] = lanes
     state["bands"] = rows
@@ -267,127 +160,12 @@ def save_bgsub_image_callback():
 
 # -------------------- Standard curve --------------------
 
-def parse_mw_list(s: str) -> List[float]:
-    """Parse a comma or whitespace separated list of molecular weights.
-
-    Uses a regex-based splitter to handle commas, spaces and newlines without
-    creating thousands of empty tokens (the previous implementation replaced
-    the empty string and caused extreme slowdowns).
-    """
-    if not s.strip():
-        return []
-    import re
-    toks = [t for t in re.split(r"[\s,]+", s.strip()) if t]
-    out: List[float] = []
-    for t in toks:
-        try:
-            out.append(float(t))
-        except ValueError:
-            continue
-    return out
-
 def update_lane_combo():
     lanes = state.get("lanes", [])
     labels = [f"Lane {i+1}" for i in range(len(lanes))]
     dpg.configure_item("ui_ladder_lane", items=labels)
     if labels:
         dpg.set_value("ui_ladder_lane", labels[0])
-
-
-def fit_standard_curve():
-    rows = state.get("bands", [])
-    if not rows:
-        dpg.set_value("ui_status", "Run detection first")
-        return
-    lane_label = dpg.get_value("ui_ladder_lane")
-    if not lane_label:
-        dpg.set_value("ui_status", "No lane selected")
-        return
-    lane_idx = int(lane_label.split()[-1])  # 1-based
-    order = dpg.get_value("ui_match_order")  # "top->bottom" or "bottom->top"
-    mw_text = dpg.get_value("ui_mw_text")
-    mw_list = parse_mw_list(mw_text)
-    if len(mw_list) == 0:
-        dpg.set_value("ui_status", "Enter MW list (kDa)")
-        return
-
-    lane_peaks = [r for r in rows if r["lane"] == lane_idx]
-    lane_peaks = sorted(lane_peaks, key=lambda r: r["y"])  # top->bottom (y increasing)
-    ys = [r["y"] for r in lane_peaks]
-    if len(ys) == 0:
-        dpg.set_value("ui_status", "No bands in the ladder lane")
-        return
-    if order == "bottom->top":
-        ys = list(reversed(ys))
-    n = min(len(ys), len(mw_list))
-    ys  = np.array(ys[:n], dtype=float)
-    mws = np.array(mw_list[:n], dtype=float)
-
-    log_mw = np.log10(mws)
-    lr = linregress(ys, log_mw)
-    a, b, r = float(lr.slope), float(lr.intercept), float(lr.rvalue)
-    r2 = float(r*r)
-    state["curve"] = (a, b, r2)
-    dpg.set_value("ui_curve_text", f"log10(MW) = {a:.6f}*y + {b:.6f}    R^2={r2:.4f}  (n={n})")
-    dpg.set_value("ui_status", "Curve fitted")
-
-
-def apply_curve_to_all():
-    if state.get("curve") is None:
-        dpg.set_value("ui_status", "Fit a curve first")
-        return
-    a,b,_ = state["curve"]
-    for r in state.get("bands", []):
-        r["mw_fit_kDa"] = float(10 ** (a*float(r["y"]) + b))
-    dpg.set_value("ui_status", "Applied curve to all bands")
-
-
-def save_curve():
-    if state.get("curve") is None:
-        dpg.set_value("ui_status", "No curve to save")
-        return
-    name = dpg.get_value("ui_curve_name").strip()
-    if not name:
-        dpg.set_value("ui_status", "Enter curve name")
-        return
-    a,b,r2 = state["curve"]
-    path = "standard_curves.json"
-    data = {}
-    if os.path.exists(path):
-        try:
-            data = json.load(open(path, "r", encoding="utf-8"))
-        except Exception:
-            data = {}
-    data[name] = {"a": a, "b": b, "r2": r2}
-    json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    refresh_curve_dropdown()
-    dpg.set_value("ui_status", f"Saved curve '{name}'")
-
-
-def refresh_curve_dropdown():
-    path = "standard_curves.json"
-    items = []
-    if os.path.exists(path):
-        try:
-            items = list(json.load(open(path, "r", encoding="utf-8")).keys())
-        except Exception:
-            items = []
-    dpg.configure_item("ui_curve_load", items=items)
-
-
-def load_curve_selected(sender, app_data):
-    name = app_data
-    path = "standard_curves.json"
-    if not name or not os.path.exists(path):
-        return
-    data = json.load(open(path, "r", encoding="utf-8"))
-    if name not in data:
-        return
-    a = float(data[name]["a"]) ; b = float(data[name]["b"]) ; r2 = float(data[name]["r2"])
-    state["curve"] = (a,b,r2)
-    state["curve_name"] = name
-    dpg.set_value("ui_curve_text", f"[{name}] log10(MW) = {a:.6f}*y + {b:.6f}    R^2={r2:.4f}")
-    dpg.set_value("ui_status", f"Loaded curve '{name}'")
 
 # -------------------- Export --------------------
 
@@ -477,13 +255,13 @@ def build_ui():
                 dpg.add_combo(tag="ui_ladder_lane", label="ladder lane", items=[])
                 dpg.add_radio_button(tag="ui_match_order", items=["top->bottom","bottom->top"], default_value="top->bottom", horizontal=True)
                 dpg.add_input_text(tag="ui_mw_text", label="MW list (kDa)", multiline=True, height=80, hint="e.g. 10, 15, 25, 50, 75, 100")
-                dpg.add_button(label="Fit curve", callback=lambda: fit_standard_curve())
+                dpg.add_button(label="Fit curve", callback=lambda: fit_standard_curve(state))
                 dpg.add_text(tag="ui_curve_text", default_value="(no curve)")
                 dpg.add_input_text(tag="ui_curve_name", label="curve name")
                 with dpg.group(horizontal=True):
-                    dpg.add_button(label="Save curve", callback=lambda: save_curve())
-                    dpg.add_combo(tag="ui_curve_load", width=180, callback=load_curve_selected, items=[])
-                    dpg.add_button(label="Apply to all", callback=lambda: apply_curve_to_all())
+                    dpg.add_button(label="Save curve", callback=lambda: save_curve(state))
+                    dpg.add_combo(tag="ui_curve_load", width=180, callback=lambda s,a: load_curve_selected(state, a), items=[])
+                    dpg.add_button(label="Apply to all", callback=lambda: apply_curve_to_all(state))
                 dpg.add_separator()
                 dpg.add_text("Save Images")
                 dpg.add_input_text(tag="ui_save_ann_path", label="Annotated PNG", default_value="annotated.png")

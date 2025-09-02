@@ -1,0 +1,6 @@
+dearpygui
+opencv-python
+scikit-image
+scipy
+numpy
+pandas
