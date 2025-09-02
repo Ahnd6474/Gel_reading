@@ -213,8 +213,9 @@ def update_texture_and_overlay():
         col = COLORS[(li-1)%len(COLORS)]
         dpg.draw_rectangle((r["x0"], r["y0"]), (r["x1"], r["y1"]), color=col, thickness=2, parent="overlay")
 
-    # Save debug image
-    save_annotated_image_core("debug/detected.png")
+    # Optional debug save – disabled by default to avoid slow disk writes
+    if os.environ.get("GEL_DEBUG_SAVE"):
+        save_annotated_image_core("debug/detected.png")
 
 # -------------------- Save images --------------------
 
@@ -251,19 +252,23 @@ def save_bgsub_image_callback():
 # -------------------- Standard curve --------------------
 
 def parse_mw_list(s: str) -> List[float]:
+    """Parse a comma or whitespace separated list of molecular weights.
+
+    Uses a regex-based splitter to handle commas, spaces and newlines without
+    creating thousands of empty tokens (the previous implementation replaced
+    the empty string and caused extreme slowdowns).
+    """
     if not s.strip():
         return []
-    toks = [t.strip() for t in s.replace("", ",").replace("	", ",").split(",")]
-    out = []
+    import re
+    toks = [t for t in re.split(r"[\s,]+", s.strip()) if t]
+    out: List[float] = []
     for t in toks:
-        if not t:
-            continue
         try:
             out.append(float(t))
-        except Exception:
-            pass
+        except ValueError:
+            continue
     return out
-
 
 def update_lane_combo():
     lanes = state.get("lanes", [])
