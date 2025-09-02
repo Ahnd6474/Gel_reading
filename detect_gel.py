@@ -57,9 +57,25 @@ COLORS = [(0,255,0),(0,200,255),(255,0,0),(255,0,255),(255,160,0),(0,255,160)]
 # -------------------- Core detection --------------------
 
 def load_gray(path: str) -> np.ndarray:
-    g = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    """Load image at *path* as grayscale.
+
+    Using ``cv2.imread`` can trigger a crash on Windows when the file path
+    contains non-ASCII characters (e.g. Korean).  To avoid this, read the
+    file bytes manually and decode with ``cv2.imdecode``, which correctly
+    handles Unicode paths.  If decoding fails, raise ``RuntimeError`` so the
+    caller can report an error instead of the process exiting with
+    ``0xC0000005``.
+    """
+
+    try:
+        # ``np.fromfile`` supports Unicode paths on Windows.
+        data = np.fromfile(path, dtype=np.uint8)
+    except Exception as e:
+        raise RuntimeError(f"Failed to read image bytes: {path}: {e}")
+
+    g = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
     if g is None:
-        raise RuntimeError(f"Failed to load image: {path}")
+        raise RuntimeError(f"Failed to decode image: {path}")
     return g
 
 
